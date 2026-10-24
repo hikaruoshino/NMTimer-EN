@@ -109,3 +109,7 @@ MIT License. See `LICENSE`.
 
 * **v0.5.2 (2026-10-23)** English edition. Distances use yalms.
 * The version history before that belongs to the Japanese edition (v0.1.0 to v0.5.2): lottery and timed NMs, the HUD, sound and chat notices, measurements, manual records, adding NMs; PH respawn measurement per ID and zone; `//nmt ph del` / `ph list`; `//nmt scan`.
+
+## Feedback
+
+A one-line "it works" is welcome too. With a GitHub account you can post from [Issues](../../issues/new/choose).
