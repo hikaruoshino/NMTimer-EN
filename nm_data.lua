@@ -112,7 +112,7 @@ local data = {
     {key = "lumbering_lambert", name = "Lumbering Lambert", kind = "lottery", zones = {"La Theine Plateau"}, ph = {"Battering Ram"}, min = 30, approx = true, hint = "Around G-9 to I-9. The Battering Ram on the east side is the target (not the west). Reported to appear after 30 minutes", src = S .. "3952.html"},
     {key = "deadly_dodo", name = "Deadly Dodo", kind = "lottery", zones = {"Sauromugue Champaign"}, ph = {"Tabar Beak"}, hint = "I-6 to K-6. Of the 2 Tabar Beak, the upper one on the scan is the target. The shortened time is unknown (set it with //nmt time)", src = S .. "9038.html"},
     {key = "vuu_puqu_the_beguiler", name = "Vuu Puqu the Beguiler", kind = "lottery", zones = {"Giddeus"}, ph = {"Yagudo Piper"}, min = 20, hint = "The innermost clearing at H-14. Only the Yagudo Piper is the target", src = S .. "14540.html"},
-    {key = "buburimboo", name = "Buburimboo", kind = "lottery", zones = {"Buburimu Peninsula"}, ph = {"Shoal Pugil"}, min = 15, approx = true, hint = "Migoya beach (Japanese wiki: ミゴヤ砂浜) at K-7. Of the 4 Shoal Pugil, the bottom one on the scan is the target. 15 minutes at the latest", src = S .. "11993.html"},
+    {key = "buburimboo", name = "Buburimboo", kind = "lottery", zones = {"Buburimu Peninsula"}, ph = {"Shoal Pugil"}, min = 15, approx = true, hint = "Migoya beach at K-7. Of the 4 Shoal Pugil, the bottom one on the scan is the target. 15 minutes at the latest", src = S .. "11993.html"},
     {key = "zokhu_blackcloud", name = "Zo'Khu Blackcloud", kind = "lottery", zones = {"Beadeaux"}, ph = {"Zircon Quadav"}, min = 20, approx = true, ph_repop = 12, hint = "On top of the high ground at E-11 to F-11. 20 minutes at most", src = S .. "3955.html"},
     {key = "stray_mary", name = "Stray Mary", kind = "lottery", zones = {"Konschtat Highlands"}, ph = {"Mad Sheep"}, min = 40, approx = true, hint = "Two places near the windmills at F-6 and F-9. At F-6 the top of 5, at F-9 the 2nd from the top is the target. 40 minutes or less", src = S .. "3949.html"},
     {key = "hawkeyed_dnatbat", name = "Hawkeyed Dnatbat", kind = "lottery", zones = {"Davoi"}, ph = {"Orcish Cursemaker"}, min = 20, approx = true, hint = "From the pond at L-8 to L-9 along the passage. Reported to appear after about 20 minutes", src = S .. "6435.html"},
@@ -165,7 +165,7 @@ local data = {
     ---------------------------------------------------------------------------
     {key = "ogopogo", name = "Ogopogo", kind = "timed", min = 15, max = 20,
      zones = {"Abyssea - Uleguerand"},
-     hint = "Crescent-shaped scarlet jade. Around H-8 and G-9 (landmarks the wiki calls アクロリス and ギア)",
+     hint = "Crescent-shaped scarlet jade. Around H-8 and G-9 (near two landmarks marked on the Japanese wiki map)",
      src = S .. "22875.html"},
 }
 
