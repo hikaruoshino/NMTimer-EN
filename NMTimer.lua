@@ -1,5 +1,5 @@
 -- =============================================================================
--- NMTimer.lua : NM respawn timer (v0.5.2, English edition)
+-- NMTimer.lua : NM respawn timer (v0.6.0, English edition)
 -- =============================================================================
 -- Purpose:
 -- When an NM from a Magian trial (Empyrean weapon trials) is killed, remember when and where,
@@ -10,7 +10,7 @@
 --   - lottery : the NM spawns when a PH is killed. For a fixed time after the NM dies, no lottery runs.
 --                         That waiting time is what is counted
 --   - timed   : respawns a fixed time after being killed (Abyssean NMs etc.)
---   Bundled NMs are in nm_data.lua. NMs you add yourself are saved in data/user.lua (//nmt add)
+--   Bundled NMs are in nm_data.lua and nm_data_bgwiki.lua. NMs you add yourself are saved in data/user.lua (//nmt add)
 --
 -- How it works:
 --   - The enemy update packet (0x00E) tells it when an enemy has died (status 2 or 3). Only kills within your own
@@ -24,6 +24,12 @@
 --     If the ID has measurements, they are used (individual PHs can differ); otherwise the median for the zone is used.
 --     However many PHs there are (e.g. one of two PHs with different IDs is the lottery target), //nmt ph registers any number.
 --     If a non-PH enemy was counted by mistake, //nmt ph del removes it
+--   - The bundled data holds no enemy IDs. When an update carrying a name arrives (an enemy appears) and it matches a registered NM,
+--     its ID is remembered (only while you are in that zone; dropped if a different name shows up on the same ID). If the name cannot
+--     be read when it dies, an NM with a remembered ID is still recorded
+--   - An NM with no known time (no number on BG-Wiki) gets its time from measurements (lottery: the shortest, timed: the median;
+--     measurements under 3 minutes are not used). A record that stays time-unknown is kept on the HUD for 3 hours.
+--     PHs in the BG-Wiki data are not counted until you mark one with //nmt ph
 --
 -- Encoding:
 --   - HUD (libs/texts.lua) : UTF-8
@@ -32,7 +38,7 @@
 
 _addon.name     = "NMTimer"
 _addon.author   = "hikaruoshino"
-_addon.version  = "0.5.2"
+_addon.version  = "0.6.0"
 _addon.commands = {"nmtimer", "nmt"}
 
 local config = require("config")
@@ -68,6 +74,10 @@ local PH_NEAR_SQ = 50 * 50                     -- range in which PH kills are re
 local PH_SIGHT_MIN_SEC = 30                    -- a PH seen sooner than this after its kill is not counted as a respawn
 local PH_SLOT_KEEP_SEC = 3 * 3600              -- how long a PH record is kept (older ones are not used for measurements either)
 local REFRESH_SEC = 0.5
+local LEARN_MIN_SEC = 180                          -- lower limit of a measurement used for learning. Stops a short value (just seeing another enemy of the same name soon after the kill) from fixing a too-short time
+local ALIVE_KEEP_SEC = 120                -- how long after the last living-state update a dead-state update still counts as a kill (older = not seen alive)
+local ALIVE_LIMIT = 4000                 -- cap for alive_seen (when exceeded only the old entries are dropped)
+local UNKNOWN_KEEP_SEC = 3 * 3600                  -- how long a record of an NM with an unknown time stays on the HUD (it has no end unless you see it spawn, so it gets a limit)
 
 -- -----------------------------------------------------------------------------
 -- Small helpers
@@ -83,6 +93,16 @@ end
 
 local function color_text(str, r, g, b)
     return string.format("\\cs(%d,%d,%d)%s\\cr", r, g, b, tostring(str or ""))
+end
+
+-- Format an enemy ID: decimal plus the in-zone number (low 12 bits) in hex, so it can be matched against map tools
+local function id_tag(id)
+    return string.format("%d / 0x%X", id, id % 4096)
+end
+local function id_tags(ids)
+    local t = {}
+    for i, id in ipairs(ids) do t[i] = id_tag(id) end
+    return t
 end
 
 local function fmt_time(sec)
@@ -166,6 +186,7 @@ local by_key = {}
 local name_index = {}       -- lowercase name / alias -> list of NMs
 local ph_index = {}         -- lowercase PH name -> list of NMs
 local zone_sets = {}       -- NM key -> set of IDs of the zones where it appears (not mixed into saved tables)
+local nm_zones = {}        -- set of IDs of zones that have at least one registered NM
 local zone_by_en = nil
 local current_zone = 0
 local state_dirty = false  -- flag: a record was removed during a display update, so save again
@@ -193,7 +214,7 @@ local function zone_label(id)
 end
 
 local function rebuild_index()
-    entries, by_key, name_index, ph_index, zone_sets = {}, {}, {}, {}, {}
+    entries, by_key, name_index, ph_index, zone_sets, nm_zones = {}, {}, {}, {}, {}, {}
     local function add_entry(e)
         if by_key[e.key] then return end
         local set = {}
@@ -203,6 +224,7 @@ local function rebuild_index()
             if id then set[id] = true end
         end
         zone_sets[e.key] = set
+        for z in pairs(set) do nm_zones[z] = true end
         entries[#entries + 1] = e
         by_key[e.key] = e
         local function index(map, name)
@@ -234,11 +256,16 @@ local function save_user()
 end
 
 local function load_all()
-    local chunk = loadfile(windower.addon_path .. "nm_data.lua")
     builtin = {}
-    if chunk then
-        local ok, tbl = pcall(chunk)
-        if ok and type(tbl) == "table" then builtin = tbl end
+    -- nm_data.lua (Magian / anomaly NMs) first, then nm_data_bgwiki.lua (per zone, from BG-Wiki). The first entry with a given key wins
+    for _, file in ipairs({"nm_data.lua", "nm_data_bgwiki.lua"}) do
+        local chunk = loadfile(windower.addon_path .. file)
+        if chunk then
+            local ok, tbl = pcall(chunk)
+            if ok and type(tbl) == "table" then
+                for _, e in ipairs(tbl) do builtin[#builtin + 1] = e end
+            end
+        end
     end
     local u = read_table(USER_FILE) or {}
     user = {entries = u.entries or {}, alias = u.alias or {}, times = u.times or {}, ignored = u.ignored or {},
@@ -248,11 +275,37 @@ local function load_all()
     rebuild_index()
 end
 
--- The time actually used (minutes). A value set by the user comes first. Returns: min, max, approx
+-- For an NM with no time in the bundled data (BG-Wiki gives no number), decide it from the respawns you have seen.
+-- Lottery: the measurement is "from the kill until it spawned after the PH was killed", so use the shortest one (the lockout is at most that).
+-- Timed: the median
+local median   -- defined below
+local function learned_minutes(e)
+    local list = state.measured[e.key]
+    if not list or #list == 0 then return nil end
+    local usable = {}
+    for _, s in ipairs(list) do
+        if s >= LEARN_MIN_SEC then usable[#usable + 1] = s end
+    end
+    if #usable == 0 then return nil end
+    local secs
+    if e.kind == "lottery" then
+        for _, s in ipairs(usable) do
+            if not secs or s < secs then secs = s end
+        end
+    else
+        secs = median(usable)
+    end
+    return math.max(1, math.floor(secs / 60))
+end
+
+-- The time actually used (minutes). A value set by the user comes first. Returns: min, max, approx, learned
 local function timing(e)
     local u = user.times[e.key]
-    if u and u.min then return u.min, u.max, false end
-    return e.min, e.max, e.approx and true or false
+    if u and u.min then return u.min, u.max, false, false end
+    if e.min then return e.min, e.max, e.approx and true or false, false end
+    local learned = learned_minutes(e)
+    if learned then return learned, nil, true, true end
+    return nil, nil, false, false
 end
 
 local function tracked(e)
@@ -276,7 +329,7 @@ local function recount_pending()
     end
 end
 
-local function median(list)
+function median(list)
     local copy = {}
     for _, v in ipairs(list) do copy[#copy + 1] = v end
     table.sort(copy)
@@ -311,11 +364,11 @@ end
 -- Records
 -- -----------------------------------------------------------------------------
 local function describe_wait(e)
-    local min, max, approx = timing(e)
+    local min, max, approx, learned = timing(e)
     if not min then return nil end
     local text
     if max and max > min then text = string.format("%d-%d min", min, max) else text = string.format("%d min", min) end
-    if approx then text = text .. " (approx.)" end
+    if learned then text = text .. " (learned)" elseif approx then text = text .. " (approx.)" end
     return text
 end
 
@@ -330,7 +383,7 @@ local function record_kill(e, zone, x, y, z, when)
     if wait then
         chat(string.format("[NMTimer] Recorded %s (%s). %s in %s", e.name, zone_label(zone), label, wait))
     else
-        chat(string.format("[NMTimer] Recorded %s (%s). The respawn time is unknown. Set it with //nmt time %s <min>", e.name, zone_label(zone), e.key), 167)
+        chat(string.format("[NMTimer] Recorded %s (%s). The time is unknown. It will be learned when you see it spawn (or set it with //nmt time %s <min>)", e.name, zone_label(zone), e.key), 167)
     end
 end
 
@@ -344,7 +397,7 @@ local function record_ph(e, zone, id, x, y, when)
     recount_pending()
     if settings.chat and not ph_told[id] then
         ph_told[id] = true
-        chat(string.format("[NMTimer] Recorded PH %s (ID %d) for %s. If this enemy is not a PH, use //nmt ph del %d", e.ph and e.ph[1] or "PH", id, e.name, id), 160)
+        chat(string.format("[NMTimer] Recorded PH %s (ID %s) for %s. If this enemy is not a PH, use //nmt ph del %d", e.ph and e.ph[1] or "PH", id_tag(id), e.name, id), 160)
     end
 end
 
@@ -359,12 +412,12 @@ local function on_ph_respawn(id, when)
     if secs < PH_SIGHT_MIN_SEC then return end              -- could be an update while it is still dying
     slots[id] = nil
     local e = by_key[slot.key]
-    if e and slot.sight and secs <= PH_SLOT_KEEP_SEC then
+    if e and slot.sight == true and secs <= PH_SLOT_KEEP_SEC then
         local list = state.ph_measured[rk] or {}
         list[#list + 1] = {id = id, secs = secs, at = when}
         while #list > 10 do table.remove(list, 1) end
         state.ph_measured[rk] = list
-        chat(string.format("[NMTimer] %s: PH (%s ID %d) respawned after about %d min (measured %s).", e.name, e.ph and e.ph[1] or "PH", id,
+        chat(string.format("[NMTimer] %s: PH (%s ID %s) respawned after about %d min (measured %s).", e.name, e.ph and e.ph[1] or "PH", id_tag(id),
             math.floor(secs / 60 + 0.5), fmt_time(secs)))
     end
     if next(slots) == nil then state.ph_slots[rk] = nil end
@@ -388,6 +441,29 @@ end
 -- Packet handling (0x00E: enemy update)
 -- -----------------------------------------------------------------------------
 local seen_dead = {}      -- ID of an enemy known to be dead -> time (do not count the same enemy twice)
+local alive_seen = {}  -- IDs of enemies seen in a living state. An enemy whose first update says dead (an NM that has not popped yet arrives that way when you get close) is not counted as killed
+local alive_n = 0
+
+-- is the last living-state update (os.clock) within ALIVE_KEEP_SEC?
+local function alive_fresh(id)
+    local t = alive_seen[id]
+    return t ~= nil and os.clock() - t <= ALIVE_KEEP_SEC
+end
+
+-- drop only the old entries (older than ALIVE_KEEP_SEC) and recount
+local function alive_prune(now_c)
+    local n = 0
+    for k, t in pairs(alive_seen) do
+        if now_c - t > ALIVE_KEEP_SEC then alive_seen[k] = nil else n = n + 1 end
+    end
+    alive_n = n
+end
+local nm_ids = {}         -- "zone:ID" -> NM key, learned from the name when it appears. IDs can be reused, so it is dropped when you change zones (not saved)
+local nm_id_count = 0
+
+local function nm_id_key(zone, id)
+    return tostring(zone) .. ":" .. tostring(id)
+end
 
 local function u32(data, offset)
     local a, b, c, d = data:byte(offset, offset + 3)
@@ -395,15 +471,69 @@ local function u32(data, offset)
     return a + b * 256 + c * 65536 + d * 16777216
 end
 
+-- When an NM appears (an update that carries a name) and the name matches a registered NM, remember that enemy's ID.
+-- The bundled data holds no IDs (the ID is taken from the enemy you actually saw, each time it appears).
+-- If the same name is in two entries for this zone, do not remember it.
+-- If a different name later shows up on the same ID, forget it (list = nil means a name that is not registered)
+local NM_ID_LIMIT = 3000
+-- is it a readable name (letters, digits, spaces, ' - . only)? An NM update carries the name elsewhere, so unreadable bytes can appear
+local function readable_name(name)
+    return name ~= nil and name:find("^[%w][%w '%-%.]*$") ~= nil
+end
+
+local function learn_nm_id(list, id, name)
+    if not list and next(nm_ids) == nil then return end     -- unregistered name and nothing learned: do nothing (no strings built)
+    local k = nm_id_key(current_zone, id)
+    local match
+    for _, e in ipairs(list or {}) do
+        if zone_sets[e.key][current_zone] then
+            if match then match = nil break end
+            match = e
+        end
+    end
+    if not match then
+        local cur = by_key[nm_ids[k]]
+        if cur then -- keep it when the name in the update is merely unreadable: the enemy list has the same name, or has no info and the name is unreadable
+            local mob = windower.ffxi.get_mob_by_id(id)
+            if mob and mob.name then
+                if mob.name:lower() == cur.name:lower() then return end
+            elseif not readable_name(name) then
+                return
+            end
+        end
+        if nm_ids[k] then -- drop it when a different enemy has taken over the same ID
+            nm_ids[k] = nil
+            nm_id_count = nm_id_count - 1
+        end
+        return
+    end
+    if nm_ids[k] == match.key then return end
+    nm_ids[k] = match.key
+    nm_id_count = nm_id_count + 1
+    if settings.debug then chat(string.format("[NMTimer debug] remembered the ID: %s (ID %s)", match.name, id_tag(id)), 160) end
+    if nm_id_count > NM_ID_LIMIT then            -- too many: drop them and learn again
+        nm_ids = {[k] = match.key}
+        nm_id_count = 1
+    end
+end
+
 local function on_death(id)
+    if alive_seen[id] then alive_seen[id] = nil; alive_n = alive_n - 1 end
     local now_c = os.clock()
     if seen_dead[id] and now_c - seen_dead[id] < 120 then return end   -- updates for a dead enemy arrive many times, so count it once
     seen_dead[id] = now_c
     local mob = windower.ffxi.get_mob_by_id(id)
-    if not mob or not mob.name or mob.is_npc == false then return end
-    if settings.debug then chat(string.format("[NMTimer debug] defeated: %s (ID %d)", mob.name, id), 160) end
+    local known = by_key[nm_ids[nm_id_key(current_zone, id)]]   -- an ID learned from its name when it appeared in this zone
+    if mob and mob.is_npc == false then return end
+    if not mob or not mob.name then
+        -- even if the name cannot be read, record an NM whose ID we learned
+        if known and zone_sets[known.key][current_zone] then record_kill(known, current_zone, nil, nil, nil, os.time()) end
+        return
+    end
+    if settings.debug then chat(string.format("[NMTimer debug] defeated: %s (ID %s)", mob.name, id_tag(id)), 160) end
     local l = mob.name:lower()
     local when = os.time()
+    learn_nm_id(name_index[l], id, mob.name)               -- learn the ID by name when it is killed (so the next appearance is recognised even if the name cannot be read)
     if settings.debug then
         -- print why nothing is recorded (name not registered / wrong zone / tracking turned off)
         local found = name_index[l]
@@ -432,46 +562,102 @@ local function on_death(id)
             local counted
             if user.ph_excluded[id] then counted = false
             elseif marked and next(marked) then counted = marked[id]
+            elseif e.quiet_ph then counted = false      -- PHs in the BG-Wiki data often share a name with common enemies: not counted until you mark one with //nmt ph
             else counted = (mob.distance or 0) <= PH_NEAR_SQ end
             if counted then record_ph(e, current_zone, id, mob.x, mob.y, when) end
         end
     end
 end
 
-local function on_sighted(name)
-    local when = os.time()
-    for _, e in ipairs(name_index[name:lower()] or {}) do
-        local rk = rec_key(e, current_zone)
-        local rec = state.records[rk]
-        if rec and rec.sight and when - rec.at >= SIGHT_MIN_SEC then
-            note_sighting(e, rec, rk, when)
-        end
+-- It was seen up after you were away (zone change, logout, unload). When it appeared is unknown, so it is neither measured nor learned: the record is just removed and you are told
+local function note_returned(e, rec, rk, when)
+    state.records[rk] = nil
+    save_state()
+    recount_pending()
+    chat(string.format("[NMTimer] %s was already up when you came back (within about %d min of the kill).", e.name, math.floor((when - rec.at) / 60 + 0.5)))
+end
+
+local function sight_entry(e, when)
+    local rk = rec_key(e, current_zone)
+    local rec = state.records[rk]
+    if rec and rec.sight and when - rec.at >= SIGHT_MIN_SEC then
+        if rec.sight == true then note_sighting(e, rec, rk, when) else note_returned(e, rec, rk, when) end
     end
 end
+
+local function on_sighted(name)
+    local when = os.time()
+    for _, e in ipairs(name_index[name:lower()] or {}) do sight_entry(e, when) end
+end
+
+-- An update in a living state arrived for the first time (it popped). PH respawns and NM reappearances are judged here.
+-- A named update (position and name only) also arrives when you merely get close to an enemy that has not popped, so it is not taken as a pop (confirmed in game 2026-10-31)
+local function on_alive(id, name)
+    if ph_pending[id] then on_ph_respawn(id, os.time()) end
+    if pending_sight then
+        local known = by_key[nm_ids[nm_id_key(current_zone, id)]]
+        if known then -- an ID learned by name when the NM was killed counts as a reappearance without reading the name in the update (an NM update can carry the name elsewhere)
+            sight_entry(known, os.time())
+            return
+        end
+        if not name then
+            local mob = windower.ffxi.get_mob_by_id(id)
+            name = mob and mob.name
+        end
+        if name and name ~= "" then on_sighted(name) end
+    end
+end
+
+-- diagnostic: with debug on, show every update that arrives for an ID set by //nmt watch (not saved)
+local watch_ids = {}
 
 local function on_npc_update(data)
     if #data < 0x20 then return end
     local mask = data:byte(0x0B)
     if not mask then return end
+    if settings.debug and next(watch_ids) then
+        local wid = u32(data, 0x05)
+        if wid and watch_ids[wid] then
+            chat(string.format("[NMTimer debug] watched update: ID %s / mask %d / status %s / length %d", id_tag(wid), mask, mask % 8 >= 4 and tostring(data:byte(0x20)) or "-", #data), 160)
+        end
+    end
     local dead = false
     if mask % 8 >= 4 then                       -- bit 2: HP and status are included
         local status = data:byte(0x20)
         if status and DEAD_STATUS[status] then
             dead = true
             local id = u32(data, 0x05)
-            if id then on_death(id) end
+            if id and alive_fresh(id) then on_death(id) end      -- count only an enemy seen alive first (an NM that has not popped arrives as dead when you get close; that is not a kill)
+        elseif status then
+            local id = u32(data, 0x05)
+            if id then
+                local now_c = os.clock()
+                local fresh = alive_seen[id] ~= nil and now_c - alive_seen[id] <= ALIVE_KEEP_SEC
+                if alive_seen[id] == nil then alive_n = alive_n + 1 end
+                alive_seen[id] = now_c
+                if alive_n > ALIVE_LIMIT then alive_prune(now_c) end
+                if not fresh then
+                    local nm = mask % 16 >= 8 and #data >= 0x35 and data:sub(0x35):match("^[^%z]*") or nil
+                    on_alive(id, nm)
+                end
+            end
         end
     end
     if mask % 16 >= 8 and not dead then         -- bit 3: name included = it appeared (respawned)
         local id = u32(data, 0x05)
         if id then
             seen_dead[id] = nil                 -- if the same enemy dies again, count it again
-            if ph_pending[id] then on_ph_respawn(id, os.time()) end
         end
     end
-    if pending_sight and mask % 16 >= 8 and #data >= 0x35 then   -- bit 3: name included (when it appears)
+    -- bit 3: name included (when it appears). In a zone with no registered NM the name is not read (keeps per-packet work down)
+    if mask % 16 >= 8 and #data >= 0x35 and nm_zones[current_zone] then
         local name = data:sub(0x35):match("^[^%z]*")
-        if name and name ~= "" then on_sighted(name) end
+        if name and name ~= "" then
+            if nm_zones[current_zone] then
+                local id = u32(data, 0x05)
+                if id then learn_nm_id(name_index[name:lower()], id, name) end
+            end
+        end
     end
 end
 
@@ -500,13 +686,14 @@ end)
 -- -----------------------------------------------------------------------------
 -- Turn one record into {text, order, ready_at, done_at} for display
 local function describe(rec, e, now)
-    local min, max, approx = timing(e)
+    local min, max, approx, learned = timing(e)
     local elapsed = now - rec.at
-    local mark = approx and color_text("(approx.)", 150, 150, 150) or ""
+    local mark = (learned and color_text("(learned)", 150, 150, 150)) or (approx and color_text("(approx.)", 150, 150, 150)) or ""
     local state_text, order, done_at
     if not min then
         state_text = color_text("time unknown", 180, 180, 180) .. string.format(" killed %s  //nmt time %s <min>", clock_text(rec.at), e.key)
         order = math.huge
+        done_at = rec.at + UNKNOWN_KEEP_SEC
     else
         local first = min * 60
         local last = (max and max > min) and max * 60 or first
@@ -668,13 +855,22 @@ local function update_zone()
     current_zone = info and info.zone or 0
 end
 
+-- Mark every measurement-waiting state (sight) as "away". If it is seen afterwards the record is just removed and you are told (it is not used for measurement or learning)
+local function mark_returned()
+    for _, rec in pairs(state.records) do if rec.sight then rec.sight = "returned" end end
+    for _, slots in pairs(state.ph_slots) do
+        for _, slot in pairs(slots) do if slot.sight then slot.sight = "returned" end end
+    end
+end
+
 windower.register_event("zone change", function(new_id)
     seen_dead = {}
-    -- after leaving the zone, measurements can no longer be taken (if it is up when you come back, you cannot tell when it appeared)
-    for _, rec in pairs(state.records) do rec.sight = false end
-    for _, slots in pairs(state.ph_slots) do
-        for _, slot in pairs(slots) do slot.sight = false end
-    end
+    alive_seen = {}
+    alive_n = 0
+    nm_ids = {}                                -- learned IDs are used only while you are in that zone
+    nm_id_count = 0
+    -- Once you leave the zone nothing is measured (when it appeared is unknown by the time you return). If it is seen later the record is just removed
+    mark_returned()
     current_zone = tonumber(new_id) or current_zone
     recount_pending()
     save_state()
@@ -682,7 +878,12 @@ end)
 
 windower.register_event("login", function()
     update_zone()
+    mark_returned()                            -- we were not watching while logged out or after a crash
     seen_dead = {}
+    alive_seen = {}
+    alive_n = 0
+    nm_ids = {}
+    nm_id_count = 0
     recount_pending()
 end)
 
@@ -694,10 +895,14 @@ end
 
 windower.register_event("logout", function()
     seen_dead = {}
+    alive_seen = {}
+    alive_n = 0
+    mark_returned()
     stop()
 end)
 
 windower.register_event("unload", function()
+    mark_returned()
     stop()
     if hud then hud:destroy() end
 end)
@@ -787,7 +992,7 @@ local function cmd_ph_list()
             for id in pairs(user.ph_ids[e.key] or {}) do ids[#ids + 1] = id end
             table.sort(ids)
             if #ids > 0 then
-                chat("      PH set: ID " .. table.concat(ids, ", ID ") .. string.format(" (%d)", #ids))
+                chat("      PH set: ID " .. table.concat(id_tags(ids), ", ID ") .. string.format(" (%d)", #ids))
             else
                 chat("      PH set: none (every same-named enemy killed nearby is counted; set one with //nmt ph)")
             end
@@ -795,12 +1000,12 @@ local function cmd_ph_list()
             for id in pairs(state.ph_slots[rk] or {}) do slot_ids[#slot_ids + 1] = id end
             table.sort(slot_ids)
             for _, id in ipairs(slot_ids) do
-                chat(string.format("      recording: ID %d (killed %s ago)", id, fmt_time(now - state.ph_slots[rk][id].at)))
+                chat(string.format("      recording: ID %s (killed %s ago)", id_tag(id), fmt_time(now - state.ph_slots[rk][id].at)))
             end
             local per_id = {}
             for _, smp in ipairs(state.ph_measured[rk] or {}) do
                 if type(smp) == "table" and smp.id then
-                    per_id[#per_id + 1] = string.format("ID %d = %s", smp.id, fmt_time(smp.secs))
+                    per_id[#per_id + 1] = string.format("ID %s = %s", id_tag(smp.id), fmt_time(smp.secs))
                 end
             end
             if #per_id > 0 then chat("      measured: " .. table.concat(per_id, ", ")) end
@@ -809,7 +1014,7 @@ local function cmd_ph_list()
     local excluded = {}
     for id in pairs(user.ph_excluded) do excluded[#excluded + 1] = id end
     table.sort(excluded)
-    if #excluded > 0 then chat("[NMTimer] IDs removed from PHs: " .. table.concat(excluded, ", ")) end
+    if #excluded > 0 then chat("[NMTimer] IDs removed from PHs: " .. table.concat(id_tags(excluded), ", ")) end
     if not any then chat(string.format("[NMTimer] No NM with a PH in %s.", zone_label(current_zone))) end
 end
 
@@ -1107,7 +1312,7 @@ windower.register_event("addon command", function(cmd, ...)
                 save_user()
                 save_state()
                 recount_pending()
-                chat(string.format("[NMTimer] Removed ID %d from the PHs (its record and measurements were also deleted). To restore it, target the enemy and use //nmt ph", id))
+                chat(string.format("[NMTimer] Removed ID %s from the PHs (its record and measurements were also deleted). To restore it, target the enemy and use //nmt ph", id_tag(id)))
 
             else
                 local t = target_mob()
@@ -1129,8 +1334,8 @@ windower.register_event("addon command", function(cmd, ...)
                     user.ph_ids[e.key][t.id] = true
                     local n = 0
                     for _ in pairs(user.ph_ids[e.key]) do n = n + 1 end
-                    chat(string.format("[NMTimer] %s: added this %s (ID %d) as a PH (%d set). While any is set, only the set enemies are counted.",
-                        e.name, utf8_name(t.name), t.id, n))
+                    chat(string.format("[NMTimer] %s: added this %s (ID %s) as a PH (%d set). While any is set, only the set enemies are counted.",
+                        e.name, utf8_name(t.name), id_tag(t.id), n))
                 end
                 save_user()
             end
@@ -1193,6 +1398,16 @@ windower.register_event("addon command", function(cmd, ...)
             config.save(settings)
             chat(string.format("[NMTimer] debug: %s (prints the names of dead enemies; use it when looking for aliases)", settings.debug and "on" or "off"))
 
+        elseif cmd == "watch" then
+            local wid = tonumber(args[1])
+            if wid then
+                watch_ids[wid] = not watch_ids[wid] or nil
+                chat(string.format("[NMTimer] %s updates for ID %s (shown while //nmt debug is on)", watch_ids[wid] and "Watching" or "Stopped watching", id_tag(wid)))
+            else
+                watch_ids = {}
+                chat("[NMTimer] Stopped watching everything. Usage: //nmt watch <enemy ID> (for investigation, not saved)")
+            end
+
         else
             print_help()
         end
@@ -1206,4 +1421,5 @@ end)
 ensure_dir()
 update_zone()
 load_all()
+mark_returned()                                -- we were not watching while the addon was unloaded or the game was closed
 recount_pending()
