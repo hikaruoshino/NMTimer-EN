@@ -38,7 +38,7 @@
 
 _addon.name     = "NMTimer"
 _addon.author   = "hikaruoshino"
-_addon.version  = "0.6.1"
+_addon.version  = "0.6.2"
 _addon.commands = {"nmtimer", "nmt"}
 
 local config = require("config")
