@@ -5,7 +5,7 @@
 NMTimer remembers when and where an NM from a Magian trial (Empyrean weapon materials) was killed, and shows the time left until it can spawn again on a small on-screen HUD. If someone else killed it before you got there, you can still aim for the next spawn once you know when and where it died.
 
 > **Status of this English edition:** the text of the addon (chat messages, HUD, data hints, comments) is in English. I have **not yet played it on an English client**. The Japanese edition was checked in game on a Japanese client (2026-10-16): kill detection and recording, HUD, position and distance, NMs you add yourself, PH set / record / respawn measurement / removal, a lottery NM (Golden Bat), an Abyssean NM (Tammuz), and Ogopogo.
-> Not checked in game in either edition: `//nmt scan`, name matching for most of the other bundled NMs, the Anomalies event NMs (the event is not running), and measured respawns of timed NMs. The sound and the early notice have been checked.
+> Not checked in game in either edition: `//nmt scan`, name matching for most of the other bundled NMs, and the Anomalies event NMs (the event is not running). The sound, the early notice and measured respawns of timed NMs have been checked.
 > The bundled times come from a Japanese wiki and only some of them have been confirmed in game. Rough ones are shown as "(approx.)". Correct them with measurements or `//nmt time` as you play.
 
 Japanese edition: https://github.com/hikaruoshino/NMTimer
@@ -122,7 +122,7 @@ The BG-Wiki NMs (`nm_data_bgwiki.lua`) come from the zone pages of [BG-Wiki](htt
 
 MIT License. See `LICENSE`.
 
-## Confirmation status in game (v0.6.0, 2026-10-31, Japanese client)
+## Confirmation status in game (v0.6.1, 2026-11-01, Japanese client)
 
 **Confirmed** (seen working in game)
 * Detecting a kill from enemy updates, recording a PH, and measuring a PH respawn (judged by the update sent when it pops).
@@ -132,15 +132,18 @@ MIT License. See `LICENSE`.
 * Recording a kill of an NM with a known time (Valkurm Emperor) and of an NM with an unknown time (Fungus Beetle; the latter says "the time is unknown, it is learned once you see it spawn").
 * The "appeared after about N min (measured)" message when an NM pops (seen twice with Valkurm Emperor, 19:18 and 15:39 after the kill, 2026-11-01).
 * Measuring a PH respawn twice in a row (Damselfly, 5:28 and 19:14, both matching the time since the kill).
+* The same message for timed NMs: the bundled Ogopogo twice (20:43 and 19:35) and Chione, an NM I added myself, three times (2026-11-01). The time is taken when the NM comes into view, so it can read a little longer than the real respawn.
+* An NM with an unknown time (Chione, added with `//nmt add`) learns its time from your measurements, and the learned time updates as they pile up (12, then 14, then 15 minutes). An NM recorded by hand with `//nmt tod` is also noticed when it appears.
 
 **Not confirmed in game**
-* The "(learned)" display and saving for an NM with an unknown time.
+* The "(learned)" display and saving for a lottery NM that pops after its PH is killed.
 * The "was already up when you came back" notice after a zone change or logout.
 * The respawn times taken from BG-Wiki (most of the 509 NMs), the PHs and the places they spawn. NMs other than Valkurm Emperor will be checked and updated in order from the reports people send in.
 * The English edition (NMTimer-EN) runs the same logic as the Japanese edition, but the v0.6.0 changes have not been run in game.
 
 ## Changelog
 
+* **v0.6.1 (2026-11-01)** The version number now matches the Japanese edition, which fixes a chat message that showed the respawn range as "15?20" (the wave dash could not be converted to Shift-JIS); the English edition was not affected. Updated the confirmation status in this README: respawns of timed NMs and learning for an NM with an unknown time are now confirmed.
 * **v0.6.0 (2026-10-31)** Bundles 509 lottery / timed NMs from BG-Wiki zone pages (`nm_data_bgwiki.lua`). An NM with no known time learns its time from the respawn you see after a kill. Enemy IDs are not stored in the data: an NM is matched by the name it has when it appears, and its ID is remembered when you kill it (so the next appearance is recognised even if the name cannot be read; dropped when you change zones or reload). Fixed an NM you merely walk up to being recorded as killed, and a PH being reported as respawned (a kill is counted only for an enemy seen alive, and an appearance / respawn is judged by a living-state update). IDs on screen and in chat are shown as "decimal / 0x low 12 bits", so they can be matched against map tools. An NM seen already up after a zone change, logout or unload is neither measured nor learned: you are told "was already up when you came back" and its record is removed. A time-unknown record stays on the HUD for 3 hours. BG-Wiki PHs are not counted until you mark one with `//nmt ph`.
 * **v0.5.2 (2026-10-23)** English edition. Distances use yalms.
 * The version history before that belongs to the Japanese edition (v0.1.0 to v0.5.2): lottery and timed NMs, the HUD, sound and chat notices, measurements, manual records, adding NMs; PH respawn measurement per ID and zone; `//nmt ph del` / `ph list`; `//nmt scan`.
