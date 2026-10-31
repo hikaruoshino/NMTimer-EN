@@ -4,7 +4,7 @@
 
 NMTimer remembers when and where an NM from a Magian trial (Empyrean weapon materials) was killed, and shows the time left until it can spawn again on a small on-screen HUD. If someone else killed it before you got there, you can still aim for the next spawn once you know when and where it died.
 
-> **Status of this English edition:** the text of the addon (chat messages, HUD, data hints, comments) is in English, and the addon passes the same simulated-environment tests as the Japanese edition. I have **not yet played it on an English client**. The Japanese edition was checked in game on a Japanese client (2026-10-16): kill detection and recording, HUD, position and distance, NMs you add yourself, PH set / record / respawn measurement / removal, a lottery NM (Golden Bat), an Abyssean NM (Tammuz), and Ogopogo.
+> **Status of this English edition:** the text of the addon (chat messages, HUD, data hints, comments) is in English. I have **not yet played it on an English client**. The Japanese edition was checked in game on a Japanese client (2026-10-16): kill detection and recording, HUD, position and distance, NMs you add yourself, PH set / record / respawn measurement / removal, a lottery NM (Golden Bat), an Abyssean NM (Tammuz), and Ogopogo.
 > Not checked in game in either edition: `//nmt scan`, name matching for most of the other bundled NMs, the Anomalies event NMs (the event is not running), the sound and the early notice, and measured respawns of timed NMs.
 > The bundled times come from a Japanese wiki and only some of them have been confirmed in game. Rough ones are shown as "(approx.)". Correct them with measurements or `//nmt time` as you play.
 
@@ -18,7 +18,7 @@ Japanese edition: https://github.com/hikaruoshino/NMTimer
 * Shows the time left on a HUD. Several NMs can be tracked at once. Drag the HUD to move it. Counting continues across zone changes and logout.
 * Warns you before the spawn. By default 5 minutes before it can spawn (change it with `//nmt lead`), and again when it can spawn, in the chat log and with a sound.
 * Remembers where. The kill position and your current distance to it are shown.
-* Works for NMs with an unknown time. It tells you "The respawn time is unknown" and you set the minutes with `//nmt time`.
+* Works for NMs with an unknown time. It tells you the time is unknown and learns it when you see the NM spawn after a kill; you can also set the minutes with `//nmt time`.
 * Measures real respawn times. If you stay in the zone and an enemy of the same name appears again, the elapsed time is remembered and listed.
 * Measures PH respawn times too. When you kill a PH, it remembers the time and the enemy ID. When an enemy with the same ID appears again, the elapsed time becomes a measurement. Up to 10 measurements are kept per ID and zone. The next time you kill a PH, the HUD counts down with the median of that ID's measurements (or, if there are none, of the zone's) and shows something like "PH respawn in 4:52 (measured)". PH respawn times can differ per PH and per zone, so a first measurement is used as soon as it exists.
 * Any number of PHs can be registered. This covers NMs where one of two PHs with different IDs is the lottery target. If a non-PH enemy was counted by mistake, `//nmt ph del` removes it (its record goes too).
@@ -28,7 +28,7 @@ Japanese edition: https://github.com/hikaruoshino/NMTimer
 ## Bundled NMs
 
 * **Magian / anomaly NMs (73)**: the table below. `nm_data.lua`.
-* **BG-Wiki NMs (509)**: taken from the zone pages in zone ID order: 217 lottery and 292 timed NMs. `nm_data_bgwiki.lua`. A respawn time is given as a number for 248 of the timed ones and a few others; the rest start as "time unknown" and are learned once you see them spawn after a kill. NMs spawned by a trigger (item trade), quest / mission, Unity, Voidwatch / Voidwalker, fished-up and Dynamis NMs are not included. A PH is included only when the page gives one.
+* **BG-Wiki NMs (509)**: taken from the zone pages: 217 lottery and 292 timed NMs. `nm_data_bgwiki.lua`. Of the 292 timed NMs, 248 have a respawn time given as a number; the other 44 and all lottery NMs start as "time unknown" and are learned once you see them spawn after a kill. NMs spawned by a trigger (item trade), quest / mission, Unity, Voidwatch / Voidwalker, fished-up and Dynamis NMs are not included. A PH is included only when the page gives one.
 
 ### Magian / anomaly NMs (73)
 
@@ -40,7 +40,7 @@ NMs from Empyrean weapon Magian trials that have a fixed zone (weapon NMs, Abyss
 | Timed (17) | Abyssea: Capricornus, Yacumama, Lamprey Lord, Shoggoth, Jyeshtha, Farruca Fly, Skuld, Urd, Erebus, Feuerunke, Chesma, Tammuz (about 60 minutes after being defeated, one per zone). Also Ogopogo (Abyssea - Uleguerand, 15 to 20 minutes), Barbastelle (King Ranperre's Tomb, 15 to 20 minutes), and the Anomalies event's Kirin (Ru'Aun Gardens), Fafnir (The Boyahda Tree) and Alexander (Alzadaal Undersea Ruins; spawn point is random), 55 minutes after the kill | From the kill until the respawn |
 
 * A lottery NM works like this: killing its PH does not spawn it for a fixed time after the NM died. The addon counts down that time. For NMs whose PH respawn interval is known (Ramponneau, Keeper of Halidom, Serra and others), it also counts down until the PH spawns again.
-* The 2013-11-05 update greatly shortened the time before the lottery for the first-stage NM of many Magian weapons.** Where the wiki gives no exact number, the figure is based on "it appeared after about N minutes" reports and is marked "(approx.)". Deadly Dodo has no known time, so its time is left empty (set it with `//nmt time`).
+* **The 2013-11-05 update greatly shortened the time before the lottery for the first-stage NM of many Magian weapons.** Where the wiki gives no exact number, the figure is based on "it appeared after about N minutes" reports and is marked "(approx.)". Deadly Dodo has no known time, so its time is left empty (set it with `//nmt time`).
 * The event's NMs drop a treasure chest when killed. The wiki says they respawn 45 minutes after the chest disappears, which is 55 minutes from the kill (measured by the page's author). The official notice says "about 45 minutes later", so there is a discrepancy. They do not spawn outside the event period.
 * Abyssean NMs are invisible; you find them by healing with a jade. Only the kill gets recorded. Only the NMs whose jade stage is up to the 2nd (Tammuz and the like) are bundled. The 3rd stage and above (Dawon and others) take long to respawn and not everyone needs them, so they are not bundled; add them with `//nmt add` (give the minutes too if you know them, for example `//nmt add 180`). The exception is Ogopogo, which is needed for a Magian trial item (the Japanese wiki calls it 無色の魂, "Colorless Soul") and is included.
 * `//nmt list` shows how to find each NM and how to tell which mob is the lottery target.
@@ -122,7 +122,7 @@ The BG-Wiki NMs (`nm_data_bgwiki.lua`) come from the zone pages of [BG-Wiki](htt
 
 MIT License. See `LICENSE`.
 
-## Confirmation status in game (v0.6.0)
+## Confirmation status in game (v0.6.0, 2026-10-31, Japanese client)
 
 **Confirmed** (seen working in game)
 * Detecting a kill from enemy updates, recording a PH, and measuring a PH respawn (judged by the update sent when it pops).
