@@ -130,9 +130,11 @@ MIT License. See `LICENSE`.
 * Remembering an NM's ID by its name when you kill it.
 * The "about 5 min left" notice, the "lottery is open" notice and the HUD countdown.
 * Recording a kill of an NM with a known time (Valkurm Emperor) and of an NM with an unknown time (Fungus Beetle; the latter says "the time is unknown, it is learned once you see it spawn").
+* The "appeared after about N min (measured)" message when an NM pops (seen twice with Valkurm Emperor, 19:18 and 15:39 after the kill, 2026-11-01).
+* Measuring a PH respawn twice in a row (Damselfly, 5:28 and 19:14, both matching the time since the kill).
 
 **Not confirmed in game**
-* The "appeared after about N min (measured)" message when an NM pops, and the "(learned)" display and saving for an NM with an unknown time. To be checked with Valkurm Emperor when there is time.
+* The "(learned)" display and saving for an NM with an unknown time.
 * The "was already up when you came back" notice after a zone change or logout.
 * The respawn times taken from BG-Wiki (most of the 509 NMs), the PHs and the places they spawn. NMs other than Valkurm Emperor will be checked and updated in order from the reports people send in.
 * The English edition (NMTimer-EN) runs the same logic as the Japanese edition, but the v0.6.0 changes have not been run in game.
