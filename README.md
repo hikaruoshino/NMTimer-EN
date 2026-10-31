@@ -5,7 +5,7 @@
 NMTimer remembers when and where an NM from a Magian trial (Empyrean weapon materials) was killed, and shows the time left until it can spawn again on a small on-screen HUD. If someone else killed it before you got there, you can still aim for the next spawn once you know when and where it died.
 
 > **Status of this English edition:** the text of the addon (chat messages, HUD, data hints, comments) is in English. I have **not yet played it on an English client**. The Japanese edition was checked in game on a Japanese client (2026-10-16): kill detection and recording, HUD, position and distance, NMs you add yourself, PH set / record / respawn measurement / removal, a lottery NM (Golden Bat), an Abyssean NM (Tammuz), and Ogopogo.
-> Not checked in game in either edition: `//nmt scan`, name matching for most of the other bundled NMs, the Anomalies event NMs (the event is not running), the sound and the early notice, and measured respawns of timed NMs.
+> Not checked in game in either edition: `//nmt scan`, name matching for most of the other bundled NMs, the Anomalies event NMs (the event is not running), and measured respawns of timed NMs. The sound and the early notice have been checked.
 > The bundled times come from a Japanese wiki and only some of them have been confirmed in game. Rough ones are shown as "(approx.)". Correct them with measurements or `//nmt time` as you play.
 
 Japanese edition: https://github.com/hikaruoshino/NMTimer
