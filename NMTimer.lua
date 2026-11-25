@@ -38,7 +38,7 @@
 
 _addon.name     = "NMTimer"
 _addon.author   = "hikaruoshino"
-_addon.version  = "0.6.2"
+_addon.version  = "0.6.3"
 _addon.commands = {"nmtimer", "nmt"}
 
 local config = require("config")
@@ -78,6 +78,13 @@ local LEARN_MIN_SEC = 180                          -- lower limit of a measureme
 local ALIVE_KEEP_SEC = 120                -- how long after the last living-state update a dead-state update still counts as a kill (older = not seen alive)
 local ALIVE_LIMIT = 4000                 -- cap for alive_seen (when exceeded only the old entries are dropped)
 local UNKNOWN_KEEP_SEC = 3 * 3600                  -- how long a record of an NM with an unknown time stays on the HUD (it has no end unless you see it spawn, so it gets a limit)
+local SAVED_LIMIT = 5000                 -- most records / learned entries / user NMs read from a save (a damaged or oversized save must not slow things down)
+local MEASURE_KEEP = 5                   -- measurements kept per NM
+local PH_MEASURE_KEEP = 10               -- measurements kept per PH
+local SAVE_RETRY_SEC = 5                 -- when saving after a display update removed a record fails, seconds until the next try
+local FUTURE_SLACK_SEC = 300             -- a record whose time (at) is later than now by more than this is not used (PC clock set back, damaged save)
+local BROKEN_KEEP = 5                    -- unreadable files (.broken-<date>) kept per save file, newest first
+local LOGIN_CHECK_SEC = 1                -- while logged out, how often to check whether we are logged in (in case no login event comes)
 
 -- -----------------------------------------------------------------------------
 -- Small helpers
@@ -149,14 +156,6 @@ local function serialize(v, indent)
     return "{\n" .. table.concat(lines, ",\n") .. "\n" .. indent .. "}"
 end
 
-local function write_table(path, tbl)
-    local f = io.open(path, "w")
-    if not f then return false end
-    f:write("return " .. serialize(tbl) .. "\n")
-    f:close()
-    return true
-end
-
 local function read_table(path)
     local chunk = loadfile(path)
     if not chunk then return nil end
@@ -166,11 +165,267 @@ local function read_table(path)
     return nil
 end
 
-local last_error_at = -100
-local function report_error(where, err)
+local function file_present(path)
+    local f = io.open(path, "rb")
+    if not f then return false end
+    f:close()
+    return true
+end
+
+local function read_text(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+-- The name an unreadable file is kept under (path.broken-<date>). A second one in the same second gets -02, -03, ... so it
+-- does not collide with the first
+local function broken_name(path)
+    local base = path .. ".broken-" .. os.date("%Y%m%d-%H%M%S", os.time())
+    if not file_present(base) then return base end
+    for n = 2, 99 do
+        local name = string.format("%s-%02d", base, n)
+        if not file_present(name) then return name end
+    end
+    return nil
+end
+
+-- Keep only the newest BROKEN_KEEP .broken- files of path (ordered by the date in the name; only names in our own format)
+local function prune_broken(path)
+    if type(windower.get_dir) ~= "function" then return end
+    local dir, file = path:match("^(.*)[/\\]([^/\\]+)$")
+    if not dir then return end
+    local ok, list = pcall(windower.get_dir, dir)
+    if not ok or type(list) ~= "table" then return end
+    local prefix = file .. ".broken-"
+    local found = {}
+    for _, name in pairs(list) do
+        if type(name) == "string" and name:sub(1, #prefix) == prefix
+                and name:sub(#prefix + 1):find("^%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d") then
+            found[#found + 1] = name
+        end
+    end
+    if #found <= BROKEN_KEEP then return end
+    table.sort(found)                               -- date order (-02 ... of the same second come after it)
+    for i = 1, #found - BROKEN_KEEP do os.remove(dir .. "/" .. found[i]) end
+end
+
+-- Paths whose unreadable file could not be renamed. Saving must not rotate such a file into .bak (that would drop a good .bak)
+local broken_left = {}
+
+-- Saving goes through a temporary file (.tmp) in the same folder. The write and the close must both succeed and the
+-- file must read back intact before it takes the real name, so a full disk or a crash mid-save never costs the last
+-- good save. os.rename on Windows cannot replace an existing file, so the current file is moved to .prev, the temporary
+-- file takes the real name, and only then does .prev become .bak (the previous save).
+-- A good .bak is never deleted before the new file is in place (whichever step fails, the real file or .bak can restore it).
+-- If the swap is cut off halfway, loading falls back to .prev and .bak.
+-- Returns: success, reason for failure
+local function write_table(path, tbl)
+    local text = "return " .. serialize(tbl) .. "\n"
+    local tmp, prev, bak = path .. ".tmp", path .. ".prev", path .. ".bak"
+    local f, err = io.open(tmp, "w")
+    if not f then return false, err end
+    local wrote, werr = f:write(text)
+    local closed, cerr = f:close()
+    if not wrote or not closed then
+        os.remove(tmp)
+        return false, werr or cerr or "write failed"
+    end
+    if read_text(tmp) ~= text or not read_table(tmp) then
+        os.remove(tmp)
+        return false, "verify failed: " .. tmp
+    end
+    if broken_left[path] then
+        -- the unreadable file is still there: moving it to .prev / .bak would drop the good .bak, so rename it again or delete it
+        local name = broken_name(path)
+        if not (name and os.rename(path, name)) then os.remove(path) end
+        if file_present(path) then
+            os.remove(tmp)
+            return false, "could not move the unreadable " .. path
+        end
+        broken_left[path] = nil
+    end
+    local moved = false
+    if file_present(path) then
+        os.remove(prev)                             -- left over from an earlier cut-off save (the real file exists, so it is not needed)
+        local ok, merr = os.rename(path, prev)
+        if not ok then
+            os.remove(tmp)
+            return false, merr
+        end
+        moved = true
+    end
+    local ok, rerr = os.rename(tmp, path)
+    if not ok then
+        if moved then os.rename(prev, path) end     -- put the previous save back under the real name (.bak was not touched)
+        os.remove(tmp)
+        return false, rerr
+    end
+    if file_present(prev) then                      -- the new file is in place, so the previous one becomes .bak
+        os.remove(bak)
+        os.rename(prev, bak)                        -- if this fails, .prev stays and loading can still use it
+    end
+    return true
+end
+
+-- -----------------------------------------------------------------------------
+-- Checking loaded tables (a file can parse and still hold values of the wrong type)
+-- -----------------------------------------------------------------------------
+local function finite(v)
+    return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+local function opt_finite(v) return v == nil or finite(v) end
+local function is_string(v) return type(v) == "string" end
+local function valid_sight(v) return v == nil or v == true or v == false or v == "returned" end
+
+-- nil, or a table whose array items all pass check
+local function list_of(v, check)
+    if v == nil then return true end
+    if type(v) ~= "table" then return false end
+    for _, x in ipairs(v) do
+        if not check(x) then return false end
+    end
+    return true
+end
+
+-- Copy the items of a table that pass check(k, v), up to SAVED_LIMIT of them
+local function keep_valid(map, check)
+    local out, n = {}, 0
+    for k, v in pairs(map or {}) do
+        if n >= SAVED_LIMIT then break end
+        if check(k, v) then out[k] = v; n = n + 1 end
+    end
+    return out
+end
+
+-- Whether the time at is later than now by more than FUTURE_SLACK_SEC. Such a record shows a huge remaining time, and its
+-- respawn and learning never come
+local function future(at, now)
+    return at > now + FUTURE_SLACK_SEC
+end
+
+-- now: the current time to compare with (os.time). Omitted: now
+local function valid_record(rk, r, now)
+    return type(rk) == "string" and type(r) == "table" and is_string(r.key) and finite(r.zone) and finite(r.at)
+        and not future(r.at, now or os.time())
+        and opt_finite(r.x) and opt_finite(r.y) and opt_finite(r.z) and valid_sight(r.sight)
+end
+
+local function valid_slot(id, s, now)
+    return finite(id) and type(s) == "table" and is_string(s.key) and finite(s.zone) and finite(s.at)
+        and not future(s.at, now or os.time())
+        and opt_finite(s.x) and opt_finite(s.y) and valid_sight(s.sight) and (s.name == nil or is_string(s.name))
+end
+
+-- Keep the measurements that pass check, at most keep of them (the newest)
+local function clean_samples(list, check, keep)
+    local out = {}
+    for _, v in ipairs(list) do
+        if check(v) then out[#out + 1] = v end
+    end
+    while #out > keep do table.remove(out, 1) end
+    return out
+end
+
+-- A measurement is 0 seconds or more (a negative one comes from a clock that was set back)
+local function valid_secs(v)
+    return finite(v) and v >= 0
+end
+
+local function valid_ph_sample(smp, now)
+    return type(smp) == "table" and finite(smp.id) and valid_secs(smp.secs) and opt_finite(smp.at)
+        and (smp.at == nil or not future(smp.at, now or os.time()))
+end
+
+-- Check the contents of state.lua. A wrong top-level type returns nil (not used). Bad items are dropped. Missing tables become empty
+local function clean_state(s)
+    if type(s) ~= "table" then return nil end
+    for _, field in ipairs({"records", "ph_slots", "ph_measured", "measured"}) do
+        if s[field] ~= nil and type(s[field]) ~= "table" then return nil end
+    end
+    local now = os.time()                      -- records, PH records and measurements later than this are dropped
+    -- Records: over the limit, the newest are kept
+    local src, keys = s.records or {}, {}
+    for rk, r in pairs(src) do
+        if valid_record(rk, r, now) then keys[#keys + 1] = rk end
+    end
+    if #keys > SAVED_LIMIT then table.sort(keys, function(a, b) return src[a].at > src[b].at end) end
+    local records = {}
+    for i = 1, math.min(#keys, SAVED_LIMIT) do records[keys[i]] = src[keys[i]] end
+    -- PH records: check each per-ID item inside each zone table (SAVED_LIMIT items in total)
+    local ph_slots, n = {}, 0
+    for rk, slots in pairs(s.ph_slots or {}) do
+        if type(rk) == "string" and type(slots) == "table" then
+            local kept
+            for id, slot in pairs(slots) do
+                if n >= SAVED_LIMIT then break end
+                if valid_slot(id, slot, now) then
+                    kept = kept or {}
+                    kept[id] = slot
+                    n = n + 1
+                end
+            end
+            if kept then ph_slots[rk] = kept end
+        end
+    end
+    -- Learned data (measurements)
+    local ph_measured = keep_valid(s.ph_measured, function(rk, list) return type(rk) == "string" and type(list) == "table" end)
+    for rk, list in pairs(ph_measured) do
+        local kept = clean_samples(list, valid_ph_sample, PH_MEASURE_KEEP)
+        ph_measured[rk] = #kept > 0 and kept or nil
+    end
+    local measured = keep_valid(s.measured, function(key, list) return type(key) == "string" and type(list) == "table" end)
+    for key, list in pairs(measured) do
+        local kept = clean_samples(list, valid_secs, MEASURE_KEEP)
+        measured[key] = #kept > 0 and kept or nil
+    end
+    return {records = records, ph_slots = ph_slots, ph_measured = ph_measured, measured = measured}
+end
+
+-- An NM you added (the field types that rebuild_index, timing and ph_wait rely on)
+local function valid_entry(e)
+    return type(e) == "table" and is_string(e.key) and is_string(e.name)
+        and list_of(e.zone_ids, finite) and list_of(e.zones, is_string) and list_of(e.alias, is_string) and list_of(e.ph, is_string)
+        and opt_finite(e.min) and opt_finite(e.max) and opt_finite(e.ph_repop)
+        and (e.job == nil or is_string(e.job)) and (e.hint == nil or is_string(e.hint))
+end
+
+local USER_TABLES = {"entries", "alias", "times", "ignored", "ph_ids", "ph_times", "ph_excluded"}
+
+-- Check the contents of user.lua. A wrong top-level type returns nil (not used). Bad items are dropped. Missing tables become empty
+local function clean_user(u)
+    if type(u) ~= "table" then return nil end
+    for _, field in ipairs(USER_TABLES) do
+        if u[field] ~= nil and type(u[field]) ~= "table" then return nil end
+    end
+    local entries = {}
+    for _, e in ipairs(u.entries or {}) do
+        if #entries >= SAVED_LIMIT then break end
+        if valid_entry(e) then entries[#entries + 1] = e end
+    end
+    local ph_ids = keep_valid(u.ph_ids, function(key, ids) return is_string(key) and type(ids) == "table" end)
+    for key, ids in pairs(ph_ids) do
+        ph_ids[key] = keep_valid(ids, function(id) return finite(id) end)
+    end
+    return {
+        entries = entries,
+        alias = keep_valid(u.alias, function(key, list) return is_string(key) and type(list) == "table" and list_of(list, is_string) end),
+        times = keep_valid(u.times, function(key, t) return is_string(key) and type(t) == "table" and finite(t.min) and opt_finite(t.max) end),
+        ignored = keep_valid(u.ignored, function(key) return is_string(key) end),
+        ph_ids = ph_ids,
+        ph_times = keep_valid(u.ph_times, function(key, minutes) return is_string(key) and finite(minutes) end),
+        ph_excluded = keep_valid(u.ph_excluded, function(id) return finite(id) end),
+    }
+end
+
+local last_error_at = {}   -- message (where) -> when it was last shown. Throttled per save file and per kind of error
+-- immediate: show it now, without throttling (a failure right after a command is shown at once)
+local function report_error(where, err, immediate)
     local now = os.clock()
-    if now - last_error_at < 10 then return end   -- do not fill the screen with the same error
-    last_error_at = now
+    if not immediate and last_error_at[where] and now - last_error_at[where] < 10 then return end   -- do not fill the screen with the same error
+    last_error_at[where] = now
     chat(string.format("[NMTimer] %s: %s", where, tostring(err)), 123)
 end
 
@@ -189,9 +444,10 @@ local zone_sets = {}       -- NM key -> set of IDs of the zones where it appears
 local nm_zones = {}        -- set of IDs of zones that have at least one registered NM
 local zone_by_en = nil
 local current_zone = 0
-local state_dirty = false  -- flag: a record was removed during a display update, so save again
+local state_dirty = false  -- flag: a record was removed during a display update, so save again (cleared once a save succeeds)
+local logged_in = true      -- the HUD, alerts and packets are handled only while logged in (set from get_info at load, then by login / logout)
 local pending_sight = false -- whether any record is waiting for a respawn measurement (keeps the per-packet check light)
-local ph_pending = {}       -- ID of a PH waiting for a respawn measurement -> record key suffix (rk)
+local ph_pending = {}       -- ID of a PH waiting for a respawn measurement -> set of record key suffixes (rk)
 local ph_told = {}          -- IDs for which a PH record was announced (do not announce the same ID again)
 
 local function ensure_dir()
@@ -245,14 +501,62 @@ local function rebuild_index()
     for _, e in ipairs(user.entries) do add_entry(e) end
 end
 
-local function save_state()
+-- immediate: report a failure without throttling (when saving from a command). Returns: whether it was saved
+local function save_state(immediate)
     ensure_dir()
-    write_table(STATE_FILE, state)
+    local ok, err = write_table(STATE_FILE, state)
+    if ok then
+        state_dirty = false                    -- the current records (including removed ones) are on disk
+    else
+        report_error("could not save state.lua (the previous save is kept)", err, immediate)
+    end
+    return ok
 end
 
+-- user.lua is saved only from commands: a failure is always reported at once. Returns: whether it was saved
 local function save_user()
     ensure_dir()
-    write_table(USER_FILE, user)
+    local ok, err = write_table(USER_FILE, user)
+    if not ok then report_error("could not save user.lua (the previous save is kept)", err, true) end
+    return ok
+end
+
+-- Added to a command's result message: when the save failed, say the change is lost at the next load
+local function unsaved_note(saved)
+    return saved and "" or " (Could not be saved: this change is lost the next time the addon loads.)"
+end
+
+-- Return the table only if it can be read and passes the check (clean)
+local function read_valid(path, clean)
+    local tbl = read_table(path)
+    return tbl and clean(tbl)
+end
+
+-- Read the previous save: .prev (the file before a cut-off swap) first, otherwise .bak
+local function read_backup(path, clean)
+    return read_valid(path .. ".prev", clean) or read_valid(path .. ".bak", clean)
+end
+
+-- Read a saved file. If it cannot be read (syntax error or wrong types), keep the damaged file under another name (.broken-<date>) first,
+-- then try .bak (the previous save). Without a usable .bak, start empty (returns nil)
+-- The kept name gets a number when the same second is already taken, and only the newest BROKEN_KEEP are kept. When it cannot
+-- be renamed, the next save does not rotate it into .bak
+local function load_saved(path, label, clean)
+    broken_left[path] = nil
+    if not file_present(path) then
+        return read_backup(path, clean)        -- a swap cut off halfway leaves only .prev / .bak behind
+    end
+    local tbl = read_valid(path, clean)
+    if tbl then return tbl end
+    local keep = broken_name(path)
+    local moved = keep ~= nil and os.rename(path, keep) and true or false
+    if moved then prune_broken(path) else broken_left[path] = true end
+    local backup = read_backup(path, clean)
+    chat(string.format("[NMTimer] Could not read %s. %s %s", label,
+        moved and ("The damaged file was kept as " .. keep:match("[^/\\]+$") .. ".")
+            or "The damaged file could not be renamed (the next save tries again; the previous save (.bak) is kept).",
+        backup and "Loading the previous save (.bak) instead." or "Starting with no records."), 123)
+    return backup
 end
 
 local function load_all()
@@ -267,11 +571,8 @@ local function load_all()
             end
         end
     end
-    local u = read_table(USER_FILE) or {}
-    user = {entries = u.entries or {}, alias = u.alias or {}, times = u.times or {}, ignored = u.ignored or {},
-            ph_ids = u.ph_ids or {}, ph_times = u.ph_times or {}, ph_excluded = u.ph_excluded or {}}
-    local s = read_table(STATE_FILE) or {}
-    state = {records = s.records or {}, ph_slots = s.ph_slots or {}, ph_measured = s.ph_measured or {}, measured = s.measured or {}}
+    user = load_saved(USER_FILE, "user.lua", clean_user) or clean_user({})
+    state = load_saved(STATE_FILE, "state.lua", clean_state) or clean_state({})
     rebuild_index()
 end
 
@@ -324,7 +625,12 @@ local function recount_pending()
     ph_pending = {}
     for rk, slots in pairs(state.ph_slots) do
         for id, slot in pairs(slots) do
-            if slot.sight and slot.zone == current_zone then ph_pending[id] = rk end
+            if slot.sight and slot.zone == current_zone then
+                -- a PH listed under two or more NMs gives one ID several records; keep track of all of them
+                local set = ph_pending[id]
+                if not set then set = {}; ph_pending[id] = set end
+                set[rk] = true
+            end
         end
     end
 end
@@ -372,11 +678,12 @@ local function describe_wait(e)
     return text
 end
 
-local function record_kill(e, zone, x, y, z, when)
+-- immediate: a record made by a command (//nmt tod). A save failure is reported without throttling
+local function record_kill(e, zone, x, y, z, when, immediate)
     if not tracked(e) then return end
     local rk = rec_key(e, zone)
     state.records[rk] = {key = e.key, zone = zone, at = when, x = x, y = y, z = z, sight = (zone == current_zone)}
-    save_state()
+    save_state(immediate)
     recount_pending()
     local wait = describe_wait(e)
     local label = e.kind == "lottery" and "lottery start" or "respawn"
@@ -387,11 +694,12 @@ local function record_kill(e, zone, x, y, z, when)
     end
 end
 
-local function record_ph(e, zone, id, x, y, when)
+-- name: the enemy's name checked when it died (to tell when a different enemy appears on the same ID at respawn)
+local function record_ph(e, zone, id, x, y, when, name)
     if not tracked(e) then return end
     local rk = rec_key(e, zone)
     local slots = state.ph_slots[rk] or {}
-    slots[id] = {key = e.key, zone = zone, at = when, x = x, y = y, sight = (zone == current_zone)}
+    slots[id] = {key = e.key, zone = zone, at = when, x = x, y = y, sight = (zone == current_zone), name = name}
     state.ph_slots[rk] = slots
     save_state()
     recount_pending()
@@ -402,34 +710,47 @@ local function record_ph(e, zone, id, x, y, when)
 end
 
 -- A PH appeared again (same ID). Only if you kept watching since the kill, remember the elapsed time as a measurement
-local function on_ph_respawn(id, when)
-    local rk = ph_pending[id]
-    if not rk then return end
-    local slots = state.ph_slots[rk]
-    local slot = slots and slots[id]
-    if not slot then ph_pending[id] = nil return end
-    local secs = when - slot.at
-    if secs < PH_SIGHT_MIN_SEC then return end              -- could be an update while it is still dying
-    slots[id] = nil
-    local e = by_key[slot.key]
-    if e and slot.sight == true and secs <= PH_SLOT_KEEP_SEC then
-        local list = state.ph_measured[rk] or {}
-        list[#list + 1] = {id = id, secs = secs, at = when}
-        while #list > 10 do table.remove(list, 1) end
-        state.ph_measured[rk] = list
-        chat(string.format("[NMTimer] %s: PH (%s ID %s) respawned after about %d min (measured %s).", e.name, e.ph and e.ph[1] or "PH", id_tag(id),
-            math.floor(secs / 60 + 0.5), fmt_time(secs)))
+-- When the same ID has records under several NMs (one PH listed for two NMs), the same update handles all of them
+-- name: the current enemy's name (nil if unknown). If it differs from the name at the kill, a different enemy appeared on that ID:
+-- nothing is learned and the record is just removed
+local function on_ph_respawn(id, when, name)
+    local set = ph_pending[id]
+    if not set then return end
+    local changed, stale = false, false
+    for rk in pairs(set) do
+        local slots = state.ph_slots[rk]
+        local slot = slots and slots[id]
+        if not slot then
+            stale = true                                     -- the record is gone: recount
+        elseif name and slot.name and name:lower() ~= slot.name:lower() then
+            slots[id] = nil                                  -- a different enemy: not learned as a PH respawn
+            changed = true
+            if next(slots) == nil then state.ph_slots[rk] = nil end
+        elseif when - slot.at >= PH_SIGHT_MIN_SEC then       -- anything sooner could be an update while it is still dying
+            local secs = when - slot.at
+            slots[id] = nil
+            changed = true
+            local e = by_key[slot.key]
+            if e and slot.sight == true and secs <= PH_SLOT_KEEP_SEC then
+                local list = state.ph_measured[rk] or {}
+                list[#list + 1] = {id = id, secs = secs, at = when}
+                while #list > PH_MEASURE_KEEP do table.remove(list, 1) end
+                state.ph_measured[rk] = list
+                chat(string.format("[NMTimer] %s: PH (%s ID %s) respawned after about %d min (measured %s).", e.name, e.ph and e.ph[1] or "PH", id_tag(id),
+                    math.floor(secs / 60 + 0.5), fmt_time(secs)))
+            end
+            if next(slots) == nil then state.ph_slots[rk] = nil end
+        end
     end
-    if next(slots) == nil then state.ph_slots[rk] = nil end
-    save_state()
-    recount_pending()
+    if changed then save_state() end
+    if changed or stale then recount_pending() end
 end
 
 local function note_sighting(e, rec, rk, when)
     local secs = when - rec.at
     local list = state.measured[e.key] or {}
     list[#list + 1] = secs
-    while #list > 5 do table.remove(list, 1) end
+    while #list > MEASURE_KEEP do table.remove(list, 1) end
     state.measured[e.key] = list
     state.records[rk] = nil
     save_state()
@@ -463,6 +784,15 @@ local nm_id_count = 0
 
 local function nm_id_key(zone, id)
     return tostring(zone) .. ":" .. tostring(id)
+end
+
+-- Drop what the receiving side has observed (dead, alive, learned IDs). On zone change, login and logout
+local function reset_observed()
+    seen_dead = {}
+    alive_seen = {}
+    alive_n = 0
+    nm_ids = {}
+    nm_id_count = 0
 end
 
 local function u32(data, offset)
@@ -563,8 +893,8 @@ local function on_death(id)
             if user.ph_excluded[id] then counted = false
             elseif marked and next(marked) then counted = marked[id]
             elseif e.quiet_ph then counted = false      -- PHs in the BG-Wiki data often share a name with common enemies: not counted until you mark one with //nmt ph
-            else counted = (mob.distance or 0) <= PH_NEAR_SQ end
-            if counted then record_ph(e, current_zone, id, mob.x, mob.y, when) end
+            else counted = type(mob.distance) == "number" and mob.distance <= PH_NEAR_SQ end   -- not counted when the distance is unknown
+            if counted then record_ph(e, current_zone, id, mob.x, mob.y, when, mob.name) end
         end
     end
 end
@@ -577,28 +907,79 @@ local function note_returned(e, rec, rk, when)
     chat(string.format("[NMTimer] %s was already up when you came back (within about %d min of the kill).", e.name, math.floor((when - rec.at) / 60 + 0.5)))
 end
 
-local function sight_entry(e, when)
+-- hold: it cannot be decided whose respawn this is (two or more entries share the name). Nothing is learned and the record stays
+local function sight_entry(e, when, hold)
     local rk = rec_key(e, current_zone)
     local rec = state.records[rk]
+    if rec and future(rec.at, when) then
+        -- a record later than now (the PC clock was set back): its respawn and learning never come, so remove it
+        state.records[rk] = nil
+        save_state()
+        recount_pending()
+        return
+    end
     if rec and rec.sight and when - rec.at >= SIGHT_MIN_SEC then
-        if rec.sight == true then note_sighting(e, rec, rk, when) else note_returned(e, rec, rk, when) end
+        if rec.sight ~= true then note_returned(e, rec, rk, when)
+        elseif not hold then note_sighting(e, rec, rk, when) end
     end
 end
 
+-- Whether this zone has two or more entries with this name
+local function ambiguous_here(list)
+    local n = 0
+    for _, e in ipairs(list) do
+        if zone_sets[e.key][current_zone] then
+            n = n + 1
+            if n > 1 then return true end
+        end
+    end
+    return false
+end
+
 local function on_sighted(name)
+    local list = name_index[name:lower()]
+    if not list then return end
     local when = os.time()
-    for _, e in ipairs(name_index[name:lower()] or {}) do sight_entry(e, when) end
+    local hold = ambiguous_here(list)
+    for _, e in ipairs(list) do sight_entry(e, when, hold) end
 end
 
 -- An update in a living state arrived for the first time (it popped). PH respawns and NM reappearances are judged here.
 -- A named update (position and name only) also arrives when you merely get close to an enemy that has not popped, so it is not taken as a pop (confirmed in game 2026-10-31)
+-- Whether the name (or one of the aliases) belongs to this NM
+local function named_as(e, name)
+    for _, x in ipairs(name_index[name:lower()] or {}) do
+        if x == e then return true end
+    end
+    return false
+end
+
 local function on_alive(id, name)
-    if ph_pending[id] then on_ph_respawn(id, os.time()) end
+    if ph_pending[id] then
+        -- the current enemy's name (from the enemy list if the update's name cannot be read), checked against the PH's name at the kill
+        local current = name and readable_name(name) and name or nil
+        if not current then
+            local mob = windower.ffxi.get_mob_by_id(id)
+            if mob and mob.name and mob.name ~= "" then current = mob.name end
+        end
+        on_ph_respawn(id, os.time(), current)
+    end
     if pending_sight then
         local known = by_key[nm_ids[nm_id_key(current_zone, id)]]
-        if known then -- an ID learned by name when the NM was killed counts as a reappearance without reading the name in the update (an NM update can carry the name elsewhere)
-            sight_entry(known, os.time())
-            return
+        if known then
+            -- An ID learned by name when the NM was killed. Check the name of whatever holds the ID now, when it can be read,
+            -- because another enemy can reuse the ID. With no readable name, the ID alone counts as a reappearance
+            -- (an NM update can carry the name elsewhere)
+            local current = name and readable_name(name) and name or nil
+            if not current then
+                local mob = windower.ffxi.get_mob_by_id(id)
+                if mob and mob.name and mob.name ~= "" then current = mob.name end
+            end
+            if not current or named_as(known, current) then
+                sight_entry(known, os.time())
+                return
+            end
+            name = current                    -- a different name: not a reappearance by ID, and the record stays (only a lookup by the current name)
         end
         if not name then
             local mob = windower.ffxi.get_mob_by_id(id)
@@ -621,16 +1002,18 @@ local function on_npc_update(data)
             chat(string.format("[NMTimer debug] watched update: ID %s / mask %d / status %s / length %d", id_tag(wid), mask, mask % 8 >= 4 and tostring(data:byte(0x20)) or "-", #data), 160)
         end
     end
-    local dead = false
-    if mask % 8 >= 4 then                       -- bit 2: HP and status are included
+    local alive_id = nil                        -- ID of the enemy if this was a living update with HP above zero
+    if mask % 8 >= 4 then                       -- bit 2: HP (0x1E) and status (0x1F) are included
         local status = data:byte(0x20)
         if status and DEAD_STATUS[status] then
-            dead = true
             local id = u32(data, 0x05)
             if id and alive_fresh(id) then on_death(id) end      -- count only an enemy seen alive first (an NM that has not popped arrives as dead when you get close; that is not a kill)
         elseif status then
-            local id = u32(data, 0x05)
+            -- the living side also needs HP above zero (0x1E = HP percent 0-100, per libs/packets/fields.lua). An HP 0 update is not taken as alive
+            local hpp = data:byte(0x1F)
+            local id = hpp and hpp > 0 and u32(data, 0x05)
             if id then
+                alive_id = id
                 local now_c = os.clock()
                 local fresh = alive_seen[id] ~= nil and now_c - alive_seen[id] <= ALIVE_KEEP_SEC
                 if alive_seen[id] == nil then alive_n = alive_n + 1 end
@@ -643,11 +1026,10 @@ local function on_npc_update(data)
             end
         end
     end
-    if mask % 16 >= 8 and not dead then         -- bit 3: name included = it appeared (respawned)
-        local id = u32(data, 0x05)
-        if id then
-            seen_dead[id] = nil                 -- if the same enemy dies again, count it again
-        end
+    -- bit 3 (name) together with bit 2 (alive with HP above zero) = it respawned. If the same enemy dies again, count it again.
+    -- A name-only update (no HP data) also arrives when you merely get close to an enemy that has not popped, so the dead mark stays
+    if alive_id and mask % 16 >= 8 then
+        seen_dead[alive_id] = nil
     end
     -- bit 3: name included (when it appears). In a zone with no registered NM the name is not read (keeps per-packet work down)
     if mask % 16 >= 8 and #data >= 0x35 and nm_zones[current_zone] then
@@ -663,11 +1045,13 @@ end
 
 -- 0x02D : notice that arrives when you gain experience etc. (Target = ID of the enemy you killed; in an RoE update the Target is the player).
 -- It does not arrive for every kill (an enemy only others killed, or one that gives no experience), so it is used as a supplement to 0x00E.
--- Counted only when the enemy really is dead (seen_dead prevents a double record)
+-- Counted only when the enemy really is dead. A repeated notice for a kill already counted (experience, limit points etc.) does not
+-- overwrite the kill time (the dead mark seen_dead is cleared by a respawn update or a zone change)
+local EXP_MIN_LEN = 0x1A    -- length that reaches Message (0x18-0x19, 0x02D in libs/packets/fields.lua). Shorter packets are dropped
 local function on_exp_message(data)
-    if #data < 0x0C then return end
+    if #data < EXP_MIN_LEN then return end
     local target = u32(data, 0x09)
-    if not target then return end
+    if not target or seen_dead[target] then return end
     local mob = windower.ffxi.get_mob_by_id(target)
     if mob and mob.is_npc ~= false and ((mob.hpp or 100) == 0 or DEAD_STATUS[mob.status or -1]) then
         on_death(target)
@@ -675,6 +1059,7 @@ local function on_exp_message(data)
 end
 
 windower.register_event("incoming chunk", function(id, data)
+    if not logged_in then return end            -- nothing that arrives while logged out is used (no save, no chat)
     local handler = id == 0x00E and on_npc_update or id == 0x02D and on_exp_message
     if not handler then return end
     local ok, err = pcall(handler, data)
@@ -729,7 +1114,10 @@ local function build_rows(now)
     local rows = {}
     for rk, rec in pairs(state.records) do
         local e = by_key[rec.key]
-        if e and tracked(e) then
+        if future(rec.at, now) then
+            state.records[rk] = nil               -- later than now (the PC clock was set back): it would show a huge time, so remove it
+            state_dirty = true
+        elseif e and tracked(e) then
             local row = describe(rec, e, now)
             if row.done_at and now >= row.done_at then
                 state.records[rk] = nil           -- remove once it has been available for long enough
@@ -743,8 +1131,8 @@ local function build_rows(now)
         local soonest, soonest_slot, soonest_id, count = nil, nil, nil, 0
         for id, slot in pairs(slots) do
             local e = by_key[slot.key]
-            if not e or now - slot.at > PH_SLOT_KEEP_SEC then
-                slots[id] = nil                       -- discard old records (also not used for measurements)
+            if not e or now - slot.at > PH_SLOT_KEEP_SEC or future(slot.at, now) then
+                slots[id] = nil                       -- discard old records (also not used for measurements) and records later than now
                 state_dirty = true
             else
                 local wait = ph_wait(e, slot.zone, id)
@@ -772,10 +1160,14 @@ end
 
 local hud = texts.new("", settings)
 local last_hud_text = nil
+local next_save_retry = 0   -- when saving removed records fails, the time (os.clock) of the next try
 
 local function refresh_hud(now)
     local rows = build_rows(now)
-    if state_dirty then state_dirty = false; save_state() end
+    -- Save again after records were removed. On failure the flag (state_dirty) stays and it is retried every SAVE_RETRY_SEC seconds
+    if state_dirty and os.clock() >= next_save_retry and not save_state() then
+        next_save_retry = os.clock() + SAVE_RETRY_SEC
+    end
     if not settings.show then
         if last_hud_text ~= "" then hud:hide() end
         last_hud_text = ""
@@ -832,7 +1224,18 @@ local function check_alerts(now)
 end
 
 local next_refresh = 0
+local next_login_check = 0
+local on_login                                 -- defined below (the same work as the login event)
 windower.register_event("prerender", function()
+    if not logged_in then
+        -- loaded while logged out, everything waits for the login event. Check get_info every second and resume when logged in
+        local check_c = os.clock()
+        if check_c < next_login_check then return end
+        next_login_check = check_c + LOGIN_CHECK_SEC
+        local info = windower.ffxi.get_info()
+        if not (info and info.logged_in) then return end
+        on_login()
+    end
     local now_c = os.clock()
     if now_c < next_refresh then return end
     next_refresh = now_c + REFRESH_SEC
@@ -864,11 +1267,7 @@ local function mark_returned()
 end
 
 windower.register_event("zone change", function(new_id)
-    seen_dead = {}
-    alive_seen = {}
-    alive_n = 0
-    nm_ids = {}                                -- learned IDs are used only while you are in that zone
-    nm_id_count = 0
+    reset_observed()                           -- learned IDs are used only while you are in that zone
     -- Once you leave the zone nothing is measured (when it appeared is unknown by the time you return). If it is seen later the record is just removed
     mark_returned()
     current_zone = tonumber(new_id) or current_zone
@@ -876,27 +1275,32 @@ windower.register_event("zone change", function(new_id)
     save_state()
 end)
 
-windower.register_event("login", function()
+on_login = function()
+    logged_in = true
     update_zone()
     mark_returned()                            -- we were not watching while logged out or after a crash
-    seen_dead = {}
-    alive_seen = {}
-    alive_n = 0
-    nm_ids = {}
-    nm_id_count = 0
+    reset_observed()
     recount_pending()
-end)
+end
+windower.register_event("login", function() on_login() end)
+
+-- Save the settings (data/settings.xml). An error from libs/config.lua when the file cannot be written must not stop a command or shutdown.
+-- Returns: whether it was saved (a failure is reported in chat)
+local function save_settings()
+    local ok, err = pcall(config.save, settings)
+    if not ok then chat("[NMTimer] Could not save the settings (they apply only until the addon is reloaded): " .. tostring(err), 123) end
+    return ok
+end
 
 local function stop()
     save_state()
-    config.save(settings)
+    save_settings()
     if hud then hud:hide() end
 end
 
 windower.register_event("logout", function()
-    seen_dead = {}
-    alive_seen = {}
-    alive_n = 0
+    logged_in = false                          -- keeps the next prerender from showing the HUD again or firing alerts, and packets from being used
+    reset_observed()
     mark_returned()
     stop()
 end)
@@ -1026,7 +1430,7 @@ local function clear_for(e)
         end
     end
     recount_pending()
-    save_state()
+    return save_state(true)                    -- called from commands: a failure is reported at once
 end
 
 local function need_entry(args, usage)
@@ -1184,26 +1588,31 @@ windower.register_event("addon command", function(cmd, ...)
             if cmd == "off" then
                 user.ignored[e.key] = true
                 clear_for(e)
-                chat(string.format("[NMTimer] Stopped tracking %s. To resume: //nmt on %s", e.name, e.key))
+                local saved = save_user()
+                chat(string.format("[NMTimer] Stopped tracking %s. To resume: //nmt on %s%s", e.name, e.key, unsaved_note(saved)))
             else
                 user.ignored[e.key] = nil
-                chat(string.format("[NMTimer] Resumed tracking %s.", e.name))
+                local saved = save_user()
+                chat(string.format("[NMTimer] Resumed tracking %s.%s", e.name, unsaved_note(saved)))
             end
-            save_user()
 
         elseif cmd == "tod" then
             local e, rest = need_entry(args, "//nmt tod <NM> [min ago]")
             if not e then return end
             local ago = (tonumber(rest[1]) or 0) * 60
-            record_kill(e, current_zone, nil, nil, nil, os.time() - ago)
+            if not finite(ago) or ago < 0 then        -- a negative / infinite value would put the kill time in the future
+                chat("[NMTimer] Give the minutes ago as a number of 0 or more. //nmt tod <NM> [min ago]", 123)
+                return
+            end
+            record_kill(e, current_zone, nil, nil, nil, os.time() - ago, true)
 
         elseif cmd == "time" then
             local e, rest = need_entry(args, "//nmt time <NM> <min> [max]")
             if not e then return end
             if rest[1] and rest[1]:lower() == "reset" then
                 user.times[e.key] = nil
-                save_user()
-                chat(string.format("[NMTimer] Reset the respawn time of %s to the default.", e.name))
+                local saved = save_user()
+                chat(string.format("[NMTimer] Reset the respawn time of %s to the default.%s", e.name, unsaved_note(saved)))
                 return
             end
             local min, max = tonumber(rest[1]), tonumber(rest[2])
@@ -1212,8 +1621,8 @@ windower.register_event("addon command", function(cmd, ...)
                 return
             end
             user.times[e.key] = {min = min, max = max and max > min and max or nil}
-            save_user()
-            chat(string.format("[NMTimer] Set the respawn time of %s to %s.", e.name, describe_wait(e)))
+            local saved = save_user()
+            chat(string.format("[NMTimer] Set the respawn time of %s to %s.%s", e.name, describe_wait(e), unsaved_note(saved)))
 
         elseif cmd == "add" then
             local name = target_name()
@@ -1229,9 +1638,9 @@ windower.register_event("addon command", function(cmd, ...)
             local e = {key = make_key(utf8_name(raw)), name = utf8_name(raw), alias = {raw}, kind = "timed",
                 zone_ids = {current_zone}, min = nums[1], max = nums[2], user = true}
             user.entries[#user.entries + 1] = e
-            save_user()
+            local saved = save_user()
             rebuild_index()
-            chat(string.format("[NMTimer] Added %s (%s / %s). It will be recorded when it dies.", e.name, zone_label(current_zone), describe_wait(e) or "time unknown"))
+            chat(string.format("[NMTimer] Added %s (%s / %s). It will be recorded when it dies.%s", e.name, zone_label(current_zone), describe_wait(e) or "time unknown", unsaved_note(saved)))
 
         elseif cmd == "alias" then
             local e = need_entry(args, "//nmt alias <NM>  (target the enemy to use as the alias first)")
@@ -1240,9 +1649,9 @@ windower.register_event("addon command", function(cmd, ...)
             if not name then chat("[NMTimer] Target the enemy to use as an alias.", 123) return end
             user.alias[e.key] = user.alias[e.key] or {}
             table.insert(user.alias[e.key], name)
-            save_user()
+            local saved = save_user()
             rebuild_index()
-            chat(string.format("[NMTimer] Added an alias to %s: '%s'.", e.name, utf8_name(name)))
+            chat(string.format("[NMTimer] Added an alias to %s: '%s'.%s", e.name, utf8_name(name), unsaved_note(saved)))
 
         elseif cmd == "remove" then
             local e = need_entry(args, "//nmt remove <NM>")
@@ -1252,21 +1661,21 @@ windower.register_event("addon command", function(cmd, ...)
                 if ue.key == e.key then table.remove(user.entries, i) break end
             end
             clear_for(e)
-            save_user()
+            local saved = save_user()
             rebuild_index()
-            chat(string.format("[NMTimer] Removed %s.", e.name))
+            chat(string.format("[NMTimer] Removed %s.%s", e.name, unsaved_note(saved)))
 
         elseif cmd == "clear" then
             if #args == 0 then
                 state.records, state.ph_slots = {}, {}
                 recount_pending()
-                save_state()
-                chat("[NMTimer] Cleared all records.")
+                local saved = save_state(true)
+                chat("[NMTimer] Cleared all records." .. unsaved_note(saved))
             else
                 local e = need_entry(args, "//nmt clear [NM]")
                 if not e then return end
-                clear_for(e)
-                chat(string.format("[NMTimer] Cleared the records of %s.", e.name))
+                local saved = clear_for(e)
+                chat(string.format("[NMTimer] Cleared the records of %s.%s", e.name, unsaved_note(saved)))
             end
 
         elseif cmd == "ph" then
@@ -1283,8 +1692,8 @@ windower.register_event("addon command", function(cmd, ...)
                 local e = need_entry({unpack(args, 2)}, "//nmt ph clear <NM>")
                 if not e then return end
                 user.ph_ids[e.key] = nil
-                save_user()
-                chat(string.format("[NMTimer] Cleared all PH settings of %s. Same-named enemies killed nearby are counted.", e.name))
+                local saved = save_user()
+                chat(string.format("[NMTimer] Cleared all PH settings of %s. Same-named enemies killed nearby are counted.%s", e.name, unsaved_note(saved)))
 
             elseif sub == "del" or sub == "remove" then
                 -- a dead enemy cannot be targeted, so an ID number also works (//nmt ph list and the record notice show the ID)
@@ -1309,10 +1718,10 @@ windower.register_event("addon command", function(cmd, ...)
                 end
                 user.ph_excluded[id] = true
                 ph_pending[id] = nil
-                save_user()
-                save_state()
+                local saved_user = save_user()
+                local saved = save_state(true) and saved_user
                 recount_pending()
-                chat(string.format("[NMTimer] Removed ID %s from the PHs (its record and measurements were also deleted). To restore it, target the enemy and use //nmt ph", id_tag(id)))
+                chat(string.format("[NMTimer] Removed ID %s from the PHs (its record and measurements were also deleted). To restore it, target the enemy and use //nmt ph%s", id_tag(id), unsaved_note(saved)))
 
             else
                 local t = target_mob()
@@ -1337,7 +1746,7 @@ windower.register_event("addon command", function(cmd, ...)
                     chat(string.format("[NMTimer] %s: added this %s (ID %s) as a PH (%d set). While any is set, only the set enemies are counted.",
                         e.name, utf8_name(t.name), id_tag(t.id), n))
                 end
-                save_user()
+                if not save_user() then chat("[NMTimer]" .. unsaved_note(false), 123) end
             end
 
         elseif cmd == "scan" then
@@ -1348,8 +1757,8 @@ windower.register_event("addon command", function(cmd, ...)
             if not e then return end
             if rest[1] and rest[1]:lower() == "reset" then
                 user.ph_times[e.key] = nil
-                save_user()
-                chat(string.format("[NMTimer] Restored the PH respawn time of %s (measurements are used if there are any).", e.name))
+                local saved = save_user()
+                chat(string.format("[NMTimer] Restored the PH respawn time of %s (measurements are used if there are any).%s", e.name, unsaved_note(saved)))
                 return
             end
             local minutes = tonumber(rest[1])
@@ -1358,45 +1767,41 @@ windower.register_event("addon command", function(cmd, ...)
                 return
             end
             user.ph_times[e.key] = minutes
-            save_user()
-            chat(string.format("[NMTimer] Set the PH respawn time of %s to %s min.", e.name, tostring(minutes)))
+            local saved = save_user()
+            chat(string.format("[NMTimer] Set the PH respawn time of %s to %s min.%s", e.name, tostring(minutes), unsaved_note(saved)))
 
         elseif cmd == "lead" then
             local n = tonumber(args[1])
             if not n or n < 0 then chat(string.format("[NMTimer] Early notice: %d min before. Usage: //nmt lead <min>", settings.lead_min)) return end
             settings.lead_min = n
-            config.save(settings)
-            chat(string.format("[NMTimer] You will be notified %d min before it can spawn.", n))
+            if save_settings() then chat(string.format("[NMTimer] You will be notified %d min before it can spawn.", n)) end
 
         elseif cmd == "expire" then
             local n = tonumber(args[1])
             if not n or n < 0 then chat(string.format("[NMTimer] HUD entries stay %d min after the spawn window opens. Usage: //nmt expire <min>", settings.expire_min)) return end
             settings.expire_min = n
-            config.save(settings)
-            chat(string.format("[NMTimer] Entries are removed from the HUD %d min after they can spawn.", n))
+            if save_settings() then chat(string.format("[NMTimer] Entries are removed from the HUD %d min after they can spawn.", n)) end
 
         elseif cmd == "sound" or cmd == "chat" or cmd == "hud" or cmd == "coord" then
             local field = cmd == "hud" and "show" or cmd
             settings[field] = on_off(args[1] and args[1]:lower(), settings[field])
-            config.save(settings)
-            chat(string.format("[NMTimer] %s: %s", cmd, settings[field] and "on" or "off"))
+            if save_settings() then chat(string.format("[NMTimer] %s: %s", cmd, settings[field] and "on" or "off")) end
             last_hud_text = nil
 
         elseif cmd == "pos" and tonumber(args[1]) and tonumber(args[2]) then
             settings.pos.x, settings.pos.y = tonumber(args[1]), tonumber(args[2])
             hud:pos(settings.pos.x, settings.pos.y)
-            config.save(settings)
+            save_settings()
 
         elseif cmd == "size" and tonumber(args[1]) then
             local size = math.max(6, math.min(40, tonumber(args[1])))
             settings.text.size = size
             hud:size(size)
-            config.save(settings)
+            save_settings()
 
         elseif cmd == "debug" then
             settings.debug = on_off(args[1] and args[1]:lower(), settings.debug)
-            config.save(settings)
-            chat(string.format("[NMTimer] debug: %s (prints the names of dead enemies; use it when looking for aliases)", settings.debug and "on" or "off"))
+            if save_settings() then chat(string.format("[NMTimer] debug: %s (prints the names of dead enemies; use it when looking for aliases)", settings.debug and "on" or "off")) end
 
         elseif cmd == "watch" then
             local wid = tonumber(args[1])
@@ -1420,6 +1825,10 @@ end)
 -- -----------------------------------------------------------------------------
 ensure_dir()
 update_zone()
+do
+    local info = windower.ffxi.get_info()
+    logged_in = info and info.logged_in and true or false
+end
 load_all()
 mark_returned()                                -- we were not watching while the addon was unloaded or the game was closed
 recount_pending()

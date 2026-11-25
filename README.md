@@ -1,4 +1,4 @@
-# NMTimer (v0.6.0, English edition)
+# NMTimer (v0.6.3, English edition)
 
 **A respawn timer for NMs, for FFXI (Windower 4).**
 
@@ -98,7 +98,8 @@ It needs only Windower's standard libraries (`config`, `texts`, `resources`).
 ## How it works, and cautions
 
 * The enemy update packet (0x00E) tells it that an enemy died (status 2 or 3). The experience-gain notice (0x02D) is also used as a supplement. Only kills inside your own view range are seen.
-* Time is real time. It keeps counting across logout and zone changes (`data/state.lua`).
+* Time is real time. It keeps counting across logout and zone changes (`data/state.lua`). If you set the PC clock back by more than 5 minutes, records that are now later than the clock (NM and PH records, measurements) are removed instead of used.
+* Saves (`data/state.lua`, `data/user.lua`) are written to a temporary file (`.tmp`) and read back before they replace the old file. The previous save stays as `.bak`. A file that cannot be read is kept as `.broken-<date>` (a second one in the same second gets `-02` and so on) and `.bak` is loaded instead. Only the newest 5 `.broken-` files are kept per save file.
 * Enemy names are matched against the bundled names (English). If something is not recorded, check the name with `//nmt debug` and add an alias with `//nmt alias`.
 * A PH name is shared by many enemies, and only one or two of them are the lottery target. `//nmt list` explains how to tell. If you target the right PH and type `//nmt ph`, only that enemy's respawn is measured. If you do not, every same-named enemy that died within 50 yalms of you is counted; if it counted the wrong one, remove it with `//nmt ph del`.
 * A PH respawn is measured only if you stayed in the zone. Leaving the zone, or an update within 30 seconds of the kill, is not treated as a respawn. Records older than 3 hours are discarded. The same applies to the measured respawn of an NM itself: it needs you to stay in the zone, and an appearance within 60 seconds of the kill is not counted.
@@ -143,6 +144,15 @@ MIT License. See `LICENSE`.
 
 ## Changelog
 
+* **v0.6.3 (2026-11-25)** Sturdier saving and loading. The changes below were tested in simulation only.
+  * A save is written to a temporary file (`.tmp`) and read back. Then the current file moves to `.prev`, the new file takes its place, and `.prev` becomes `.bak`. A save cut off at any point can still be restored from the previous save or `.bak`.
+  * A file that cannot be read is kept as `.broken-<date>`, and `.bak` is loaded instead. A second one in the same second gets a number (`-02`, ...) so the names do not collide, and only the newest 5 `.broken-` files are kept per save file. If the damaged file cannot be renamed, the next save does not move it into `.bak` (a good `.bak` is never replaced by it).
+  * Loaded tables are checked, and entries of the wrong type are dropped. Up to 5000 records, learned entries and user NMs are read. Records, PH records and measurements more than 5 minutes later than now are dropped on load and when the HUD updates (with the PC clock set back, the HUD showed a huge remaining time, and neither the respawn nor learning ever came). Negative measurements are dropped too. `//nmt tod` with negative minutes records nothing.
+  * An update with 0 HP no longer counts as the enemy being alive. Experience messages (0x02D) are used only when they are at least 0x1A bytes long.
+  * When two or more entries in the current zone share a name, it cannot be told whose respawn it is: nothing is learned and the record stays.
+  * When another enemy appears under the ID of a PH or an NM, it is told apart by its name and is not taken as a respawn. When one PH is set for two NMs, a single respawn updates both.
+  * While logged out, the HUD, alerts and packets are not handled. When the addon is loaded while logged out, it resumes within a second of logging in, even if no login event comes.
+  * A failure to save the settings (`settings.xml`), `user.lua` or `state.lua` is reported. A `user.lua` failure, and a `state.lua` failure from a command, are reported every time at once, and the command's message adds that the change is lost the next time the addon loads. Other failures are reported at most once every 10 seconds per file.
 * **v0.6.2 (2026-11-01)** The version number matches the Japanese edition, which fixes 31 more garbled characters (a wave dash shown as "?" in chat) in the hint texts of its bundled data. The English edition has no such characters and is not affected.
 * **v0.6.1 (2026-11-01)** The version number now matches the Japanese edition, which fixes a chat message that showed the respawn range as "15?20" (the wave dash could not be converted to Shift-JIS); the English edition was not affected. Updated the confirmation status in this README: respawns of timed NMs and learning for an NM with an unknown time are now confirmed.
 * **v0.6.0 (2026-10-31)** Bundles 509 lottery / timed NMs from BG-Wiki zone pages (`nm_data_bgwiki.lua`). An NM with no known time learns its time from the respawn you see after a kill. Enemy IDs are not stored in the data: an NM is matched by the name it has when it appears, and its ID is remembered when you kill it (so the next appearance is recognised even if the name cannot be read; dropped when you change zones or reload). Fixed an NM you merely walk up to being recorded as killed, and a PH being reported as respawned (a kill is counted only for an enemy seen alive, and an appearance / respawn is judged by a living-state update). IDs on screen and in chat are shown as "decimal / 0x low 12 bits", so they can be matched against map tools. An NM seen already up after a zone change, logout or unload is neither measured nor learned: you are told "was already up when you came back" and its record is removed. A time-unknown record stays on the HUD for 3 hours. BG-Wiki PHs are not counted until you mark one with `//nmt ph`.
